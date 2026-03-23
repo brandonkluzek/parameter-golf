@@ -1,0 +1,30 @@
+name = "architecture_trade_suite"
+baseline = "root_train_gpt"
+script_path = "train_gpt.py"
+track = "non_record"
+resource_class = "runpod_1xh100"
+seed_mode = "fixed"
+estimator_family = "root_public_2026_03_23"
+manual_block_reason = "requires constant-byte architecture grid support and non-integer MLP hidden sizing"
+tags = ["architecture", "blocked", "future"]
+notes = "Placeholder for the constant-byte architecture trade suite once non-integer hidden sizing and byte-neutral grid support exist."
+
+[promotion]
+candidate = "exploratory"
+name = "Architecture Trade Suite"
+blurb = "Blocked placeholder for the constant-byte architecture trade suite."
+
+[env]
+DATA_PATH = "./data/datasets/fineweb10B_sp1024"
+TOKENIZER_PATH = "./data/tokenizers/fineweb_1024_bpe.model"
+VOCAB_SIZE = 1024
+TRAIN_SEQ_LEN = 1024
+TRAIN_BATCH_TOKENS = 524288
+NUM_LAYERS = 9
+MODEL_DIM = 512
+MLP_MULT = 2
+ITERATIONS = 4000
+VAL_LOSS_EVERY = 200
+TRAIN_LOG_EVERY = 50
+WARMUP_STEPS = 20
+MAX_WALLCLOCK_SECONDS = 600

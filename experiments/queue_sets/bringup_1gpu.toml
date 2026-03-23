@@ -1,0 +1,27 @@
+name = "bringup_1gpu"
+notes = "First live 1xH100 wave: smoke, fullshape checkpoint, and three timing anchors."
+priority = 100
+
+[[job]]
+manifest = "experiments/baseline_1gpu_smoke.toml"
+priority = 300
+
+[[job]]
+manifest = "experiments/baseline_1gpu_fullshape.toml"
+priority = 250
+
+[[job]]
+manifest = "experiments/timing_ladder.toml"
+variant = "timing_ladder__mlp-mult-2__num-layers-9__train-seq-len-1024"
+priority = 200
+
+[[job]]
+manifest = "experiments/timing_ladder.toml"
+variant = "timing_ladder__mlp-mult-2__num-layers-9__train-seq-len-2048"
+priority = 190
+
+[[job]]
+manifest = "experiments/timing_ladder.toml"
+variant = "timing_ladder__mlp-mult-3__num-layers-11__train-seq-len-1024"
+priority = 180
+set = { EXPORT_SCHEME = "mixed_family", EXPORT_COMPRESSOR = "zstd", EXPORT_LOWBIT_CATEGORIES = "attn,mlp", EXPORT_INT8_PATTERNS = "tok_emb", EXPORT_MLP_CLIP_RANGE = 15 }

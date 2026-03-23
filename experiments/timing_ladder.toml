@@ -1,0 +1,31 @@
+name = "timing_ladder"
+baseline = "root_train_gpt"
+script_path = "train_gpt.py"
+track = "non_record"
+resource_class = "runpod_1xh100"
+seed_mode = "fixed"
+estimator_family = "root_public_2026_03_23"
+tags = ["timing", "ladder", "calibration"]
+notes = "Single-family timing ladder for refining the root H100 step-time law."
+
+[promotion]
+candidate = "exploratory"
+name = "Timing Ladder"
+blurb = "Timing ladder over layers, MLP expansion, and train sequence length."
+
+[env]
+DATA_PATH = "./data/datasets/fineweb10B_sp1024"
+TOKENIZER_PATH = "./data/tokenizers/fineweb_1024_bpe.model"
+VOCAB_SIZE = 1024
+TRAIN_BATCH_TOKENS = 524288
+MODEL_DIM = 512
+ITERATIONS = 600
+VAL_LOSS_EVERY = 0
+TRAIN_LOG_EVERY = 50
+WARMUP_STEPS = 20
+MAX_WALLCLOCK_SECONDS = 240
+
+[matrix]
+NUM_LAYERS = [9, 10, 11]
+MLP_MULT = [2, 3]
+TRAIN_SEQ_LEN = [1024, 2048]

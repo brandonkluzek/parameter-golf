@@ -1,0 +1,48 @@
+name = "research_wave_1gpu"
+notes = "Exploratory 1xH100 research wave for pair-feature capacity and late export-alignment overhead."
+priority = 110
+
+[[job]]
+manifest = "experiments/pair_feature_bigram_ladder.toml"
+variant = "pair_feature_bigram_ladder__bigram-vocab-size-0"
+priority = 190
+
+[[job]]
+manifest = "experiments/pair_feature_bigram_ladder.toml"
+variant = "pair_feature_bigram_ladder__bigram-vocab-size-4096"
+priority = 188
+
+[[job]]
+manifest = "experiments/pair_feature_bigram_ladder.toml"
+variant = "pair_feature_bigram_ladder__bigram-vocab-size-8192"
+priority = 186
+
+[[job]]
+manifest = "experiments/pair_feature_bigram_ladder.toml"
+variant = "pair_feature_bigram_ladder__bigram-vocab-size-10240"
+priority = 184
+
+[[job]]
+manifest = "experiments/pair_feature_bigram_ladder.toml"
+variant = "pair_feature_bigram_ladder__bigram-vocab-size-12288"
+priority = 182
+
+[[job]]
+manifest = "experiments/late_export_alignment_pilot.toml"
+variant = "late_export_alignment_pilot__fp16-embed-export-0__qat-int6-0"
+priority = 170
+
+[[job]]
+manifest = "experiments/late_export_alignment_pilot.toml"
+variant = "late_export_alignment_pilot__fp16-embed-export-0__qat-int6-1"
+priority = 168
+
+[[job]]
+manifest = "experiments/late_export_alignment_pilot.toml"
+variant = "late_export_alignment_pilot__fp16-embed-export-1__qat-int6-0"
+priority = 166
+
+[[job]]
+manifest = "experiments/late_export_alignment_pilot.toml"
+variant = "late_export_alignment_pilot__fp16-embed-export-1__qat-int6-1"
+priority = 164

@@ -1,0 +1,11 @@
+name = "future_pilots_blocked"
+notes = "Blocked placeholders for theory-critical pilots that still need code support before they can run."
+priority = 90
+
+[[job]]
+manifest = "experiments/architecture_trade_suite.toml"
+priority = 120
+
+[[job]]
+manifest = "experiments/candidate_buffer_weighting_pilot.toml"
+priority = 110

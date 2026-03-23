@@ -1,0 +1,40 @@
+name = "late_export_alignment_pilot"
+baseline = "mlp3x_qat_record_script"
+script_path = "records/track_10min_16mb/2026-03-19_MLP3x_QAT_Int6_SlidingWindow/train_gpt.py"
+track = "non_record"
+resource_class = "runpod_1xh100"
+seed_mode = "fixed"
+estimator_family = "root_public_2026_03_23"
+tags = ["qat", "export_alignment", "pilot"]
+notes = "Pilot around late export alignment / QAT-style protection using the public int6-QAT record script."
+
+[promotion]
+candidate = "exploratory"
+name = "Late Export Alignment Pilot"
+blurb = "Small pilot to test whether export-gap reduction is worth the overhead."
+
+[env]
+DATA_PATH = "./data/datasets/fineweb10B_sp1024"
+TOKENIZER_PATH = "./data/tokenizers/fineweb_1024_bpe.model"
+VOCAB_SIZE = 1024
+TRAIN_SEQ_LEN = 1024
+TRAIN_BATCH_TOKENS = 524288
+NUM_LAYERS = 11
+MODEL_DIM = 512
+MLP_MULT = 3
+ITERATIONS = 1200
+VAL_LOSS_EVERY = 200
+TRAIN_LOG_EVERY = 50
+WARMUP_STEPS = 20
+MAX_WALLCLOCK_SECONDS = 240
+INT6_LAYER_START = 0
+INT6_LAYER_END = 10
+EXPORT_SCHEME = "mixed_family"
+EXPORT_COMPRESSOR = "zstd"
+EXPORT_LOWBIT_CATEGORIES = "attn,mlp"
+EXPORT_INT8_PATTERNS = "tok_emb"
+USE_ZSTD = 1
+
+[matrix]
+QAT_INT6 = [0, 1]
+FP16_EMBED_EXPORT = [0, 1]

@@ -1,0 +1,34 @@
+name = "eval_stride_sweep"
+baseline = "root_train_gpt"
+script_path = "train_gpt.py"
+track = "non_record"
+resource_class = "runpod_1xh100"
+seed_mode = "fixed"
+estimator_family = "root_public_2026_03_23"
+required_nonempty_env = ["INIT_STATE_DICT_PATH"]
+tags = ["eval", "sliding", "stride"]
+notes = "Use a fixed checkpoint via INIT_STATE_DICT_PATH and sweep final sliding-eval stride."
+
+[promotion]
+candidate = "exploratory"
+name = "Eval Stride Sweep"
+blurb = "Final sliding-eval sweep for stride/cost validation."
+
+[env]
+DATA_PATH = "./data/datasets/fineweb10B_sp1024"
+TOKENIZER_PATH = "./data/tokenizers/fineweb_1024_bpe.model"
+VOCAB_SIZE = 1024
+TRAIN_SEQ_LEN = 1024
+TRAIN_BATCH_TOKENS = 524288
+NUM_LAYERS = 9
+MODEL_DIM = 512
+MLP_MULT = 2
+ITERATIONS = 0
+WARMUP_STEPS = 0
+VAL_LOSS_EVERY = 0
+MAX_WALLCLOCK_SECONDS = 0
+INIT_STATE_DICT_PATH = ""
+FINAL_EVAL_MODE = "sliding"
+
+[matrix]
+FINAL_EVAL_STRIDE = [256, 128, 64, 32]

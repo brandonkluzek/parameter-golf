@@ -1,0 +1,53 @@
+name = "checkpoint_calibration_1gpu"
+notes = "Checkpoint-gated eval and split export calibration sweeps for the first reusable 1xH100 checkpoint."
+priority = 120
+
+[[job]]
+manifest = "experiments/eval_stride_sweep.toml"
+variant = "eval_stride_sweep__final-eval-stride-256"
+priority = 170
+
+[[job]]
+manifest = "experiments/eval_stride_sweep.toml"
+variant = "eval_stride_sweep__final-eval-stride-128"
+priority = 168
+
+[[job]]
+manifest = "experiments/eval_stride_sweep.toml"
+variant = "eval_stride_sweep__final-eval-stride-64"
+priority = 166
+
+[[job]]
+manifest = "experiments/eval_stride_sweep.toml"
+variant = "eval_stride_sweep__final-eval-stride-32"
+priority = 164
+
+[[job]]
+manifest = "experiments/export_embedding_floor_sweep.toml"
+variant = "export_embedding_floor_sweep__export-lowbit-categories-attn-mlp-embed"
+priority = 162
+
+[[job]]
+manifest = "experiments/export_embedding_floor_sweep.toml"
+variant = "export_embedding_floor_sweep__export-lowbit-categories-attn-mlp"
+priority = 160
+
+[[job]]
+manifest = "experiments/export_mlp_bank_sweep.toml"
+variant = "export_mlp_bank_sweep__export-mlp-clip-range-31"
+priority = 158
+
+[[job]]
+manifest = "experiments/export_mlp_bank_sweep.toml"
+variant = "export_mlp_bank_sweep__export-mlp-clip-range-15"
+priority = 156
+
+[[job]]
+manifest = "experiments/export_latek_island_sweep.toml"
+variant = "export_latek_island_sweep__export-fp16-patterns-value"
+priority = 154
+
+[[job]]
+manifest = "experiments/export_latek_island_sweep.toml"
+variant = "export_latek_island_sweep__export-fp16-patterns-blocks-8-attn-c-k"
+priority = 152

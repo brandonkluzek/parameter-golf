@@ -1,0 +1,39 @@
+name = "export_family_sweep"
+baseline = "root_train_gpt"
+script_path = "train_gpt.py"
+track = "non_record"
+resource_class = "runpod_1xh100"
+seed_mode = "fixed"
+estimator_family = "root_public_2026_03_23"
+required_nonempty_env = ["INIT_STATE_DICT_PATH"]
+tags = ["export", "mixed_precision", "fragility", "superseded"]
+notes = "Superseded combined checkpoint sweep kept for backward compatibility. Prefer the split embedding-floor, MLP-bank, and late-K manifests."
+
+[promotion]
+candidate = "exploratory"
+name = "Export Family Sweep"
+blurb = "Export-only family study for embedding floor, MLP int5, and late-key islands."
+
+[env]
+DATA_PATH = "./data/datasets/fineweb10B_sp1024"
+TOKENIZER_PATH = "./data/tokenizers/fineweb_1024_bpe.model"
+VOCAB_SIZE = 1024
+TRAIN_SEQ_LEN = 1024
+TRAIN_BATCH_TOKENS = 524288
+NUM_LAYERS = 9
+MODEL_DIM = 512
+MLP_MULT = 2
+ITERATIONS = 0
+WARMUP_STEPS = 0
+VAL_LOSS_EVERY = 0
+MAX_WALLCLOCK_SECONDS = 0
+INIT_STATE_DICT_PATH = ""
+EXPORT_SCHEME = "mixed_family"
+EXPORT_COMPRESSOR = "zlib"
+EXPORT_LOWBIT_CATEGORIES = "attn,mlp"
+EXPORT_INT8_PATTERNS = "tok_emb"
+EXPORT_FP16_PATTERNS = ""
+
+[matrix]
+EXPORT_MLP_CLIP_RANGE = [31, 15]
+EXPORT_FP16_PATTERNS = ["", "tok_emb", "tok_emb,blocks.8.attn.c_k"]

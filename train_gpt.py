@@ -9,14 +9,16 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import json
 import math
 import os
 import random
+import shlex
+import socket
 import subprocess
 import sys
 import time
 import uuid
-import zlib
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +28,15 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from tools.experiments.runtime import (
+    ExportConfig,
+    compress_export_blob,
+    decompress_export_blob,
+    dequantize_exported_state,
+    eval_val_sliding_window,
+    export_state_dict,
+)
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -58,6 +69,8 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    init_state_dict_path = os.environ.get("INIT_STATE_DICT_PATH", "")
+    init_state_dict_strict = bool(int(os.environ.get("INIT_STATE_DICT_STRICT", "1")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -69,6 +82,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    final_eval_mode = os.environ.get("FINAL_EVAL_MODE", "standard")
+    final_eval_stride = int(os.environ.get("FINAL_EVAL_STRIDE", 64))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -85,6 +100,29 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Export / experiment instrumentation.
+    export_scheme = os.environ.get("EXPORT_SCHEME", "int8_zlib")
+    export_compressor = os.environ.get("EXPORT_COMPRESSOR", "zlib")
+    export_lowbit_categories = tuple(
+        part.strip()
+        for part in os.environ.get("EXPORT_LOWBIT_CATEGORIES", "attn,mlp").split(",")
+        if part.strip()
+    )
+    export_int8_patterns = tuple(
+        part.strip()
+        for part in os.environ.get("EXPORT_INT8_PATTERNS", "tok_emb").split(",")
+        if part.strip()
+    )
+    export_fp16_patterns = tuple(
+        part.strip()
+        for part in os.environ.get("EXPORT_FP16_PATTERNS", "").split(",")
+        if part.strip()
+    )
+    export_embed_clip_range = int(os.environ.get("EXPORT_EMBED_CLIP_RANGE", "31"))
+    export_attn_clip_range = int(os.environ.get("EXPORT_ATTN_CLIP_RANGE", "31"))
+    export_mlp_clip_range = int(os.environ.get("EXPORT_MLP_CLIP_RANGE", "31"))
+    export_bigram_clip_range = int(os.environ.get("EXPORT_BIGRAM_CLIP_RANGE", "31"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -277,6 +315,7 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
+
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
@@ -306,120 +345,28 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+LOWBIT_CLIP_Q = 0.9999984
 
-def tensor_nbytes(t: Tensor) -> int:
-    return int(t.numel()) * int(t.element_size())
 
-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-        return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
-        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
-    return t
-
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
-
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
-        0,
+def build_export_config(args: Hyperparameters) -> ExportConfig:
+    return ExportConfig(
+        export_scheme=args.export_scheme,
+        export_compressor=args.export_compressor,
+        export_lowbit_categories=args.export_lowbit_categories,
+        export_int8_patterns=args.export_int8_patterns,
+        export_fp16_patterns=args.export_fp16_patterns,
+        export_embed_clip_range=args.export_embed_clip_range,
+        export_attn_clip_range=args.export_attn_clip_range,
+        export_mlp_clip_range=args.export_mlp_clip_range,
+        export_bigram_clip_range=args.export_bigram_clip_range,
+        control_tensor_name_patterns=CONTROL_TENSOR_NAME_PATTERNS,
+        keep_float_fp32_name_patterns=INT8_KEEP_FLOAT_FP32_NAME_PATTERNS,
+        keep_float_max_numel=INT8_KEEP_FLOAT_MAX_NUMEL,
+        keep_float_store_dtype=INT8_KEEP_FLOAT_STORE_DTYPE,
+        per_row_scale_dtype=INT8_PER_ROW_SCALE_DTYPE,
+        int8_clip_q=INT8_CLIP_Q,
+        lowbit_clip_q=LOWBIT_CLIP_Q,
     )
-
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel())
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
-
-        if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = t
-            stats["int8_payload_bytes"] += tensor_nbytes(t)
-            continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
-            continue
-
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-
-    obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-    }
-    if qmeta:
-        obj["qmeta"] = qmeta
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
-
-def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
-    out: dict[str, Tensor] = {}
-    qmeta = obj.get("qmeta", {})
-    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, q in obj["quantized"].items():
-        dtype = getattr(torch, obj["dtypes"][name])
-        s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
-            s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
-        else:
-            scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
-    for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
-        out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
-        out[name] = out_t
-    return out
 
 
 # -----------------------------
@@ -697,7 +644,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -712,15 +659,18 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids).reshape(-1, self.tok_emb.num_embeddings)
+        targets = target_ids.reshape(-1)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -768,11 +718,143 @@ def main() -> None:
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
 
+    run_dir_env = os.environ.get("RUN_DIR", "").strip()
+    run_dir = Path(run_dir_env).resolve() if run_dir_env else None
+    if master_process and run_dir is not None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+
     logfile = None
     if master_process:
-        os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{args.run_id}.txt"
+        if run_dir is not None:
+            logfile = str(run_dir / "train.log")
+        else:
+            os.makedirs("logs", exist_ok=True)
+            logfile = f"logs/{args.run_id}.txt"
         print(logfile)
+
+    def resolve_optional_path(env_name: str, default_name: str) -> Path | None:
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            return Path(raw).resolve()
+        if run_dir is not None:
+            return run_dir / default_name
+        return None
+
+    metrics_jsonl_path = resolve_optional_path("METRICS_JSONL_PATH", "metrics.jsonl")
+    heartbeat_json_path = resolve_optional_path("HEARTBEAT_JSON_PATH", "heartbeat.json")
+    summary_json_path = resolve_optional_path("SUMMARY_JSON_PATH", "summary.json")
+    export_model_path = (run_dir / "final_model.pt") if run_dir is not None else Path("final_model.pt")
+    export_blob_name = "final_model.int8.ptz" if args.export_scheme == "int8_zlib" else "final_model.export.ptz"
+    export_blob_path = (run_dir / export_blob_name) if run_dir is not None else Path(export_blob_name)
+    export_config = build_export_config(args)
+
+    git_sha = ""
+    git_sha_result = subprocess.run(["git", "rev-parse", "HEAD"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if git_sha_result.returncode == 0:
+        git_sha = git_sha_result.stdout.strip()
+    command_line = " ".join(shlex.quote(arg) for arg in sys.argv)
+    host_name = socket.gethostname()
+    manifest_name = os.environ.get("EXPERIMENT_NAME", "")
+    manifest_sha256 = os.environ.get("MANIFEST_SHA256", "")
+    queue_job_id = os.environ.get("QUEUE_JOB_ID", "")
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    start_time = time.time()
+    run_summary: dict[str, object] = {
+        "status": "running",
+        "run_id": args.run_id,
+        "experiment_name": manifest_name,
+        "manifest_sha256": manifest_sha256,
+        "git_sha": git_sha,
+        "host": host_name,
+        "script_path": str(Path(__file__).resolve()),
+        "command": command_line,
+        "start_time_unix": start_time,
+        "start_time_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time)),
+        "seed": args.seed,
+        "world_size": world_size,
+        "local_rank": local_rank,
+        "gpu_name": torch.cuda.get_device_name(device),
+        "trainer": {
+            "data_path": str(Path(args.data_path).resolve()),
+            "tokenizer_path": str(Path(args.tokenizer_path).resolve()),
+            "vocab_size": args.vocab_size,
+            "train_batch_tokens": args.train_batch_tokens,
+            "train_seq_len": args.train_seq_len,
+            "iterations": args.iterations,
+            "warmup_steps": args.warmup_steps,
+            "max_wallclock_seconds": args.max_wallclock_seconds,
+            "num_layers": args.num_layers,
+            "model_dim": args.model_dim,
+            "num_heads": args.num_heads,
+            "num_kv_heads": args.num_kv_heads,
+            "mlp_mult": args.mlp_mult,
+            "tie_embeddings": args.tie_embeddings,
+            "final_eval_mode": args.final_eval_mode,
+            "final_eval_stride": args.final_eval_stride,
+            "export_scheme": args.export_scheme,
+            "export_compressor": args.export_compressor,
+            "export_lowbit_categories": list(args.export_lowbit_categories),
+            "export_int8_patterns": list(args.export_int8_patterns),
+            "export_fp16_patterns": list(args.export_fp16_patterns),
+            "init_state_dict_path": args.init_state_dict_path or "",
+        },
+        "progress": {},
+        "metrics": {},
+        "artifacts": {},
+        "provenance": {
+            "manifest_name": manifest_name,
+            "manifest_sha256": manifest_sha256,
+            "queue_job_id": queue_job_id,
+            "cuda_visible_devices": cuda_visible_devices,
+        },
+    }
+    last_metric_event: dict[str, object] = {}
+
+    def write_json_atomic(path: Path | None, payload: dict[str, object]) -> None:
+        if not master_process or path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+
+    def emit_metric(event_type: str, **payload: object) -> None:
+        nonlocal last_metric_event
+        if not master_process:
+            return
+        event = {
+            "type": event_type,
+            "run_id": args.run_id,
+            "timestamp_unix": time.time(),
+            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **payload,
+        }
+        last_metric_event = event
+        if metrics_jsonl_path is not None:
+            metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(metrics_jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def update_heartbeat(phase: str, **payload: object) -> None:
+        if not master_process:
+            return
+        heartbeat = {
+            "run_id": args.run_id,
+            "phase": phase,
+            "timestamp_unix": time.time(),
+            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "last_event": last_metric_event,
+            "provenance": run_summary.get("provenance", {}),
+            **payload,
+        }
+        write_json_atomic(heartbeat_json_path, heartbeat)
+
+    def refresh_summary(status: str, **updates: object) -> None:
+        if not master_process:
+            return
+        run_summary["status"] = status
+        run_summary.update(updates)
+        write_json_atomic(summary_json_path, run_summary)
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -792,6 +874,7 @@ def main() -> None:
         console=False,
     )
     log0("=" * 100, console=False)
+    refresh_summary("running")
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -840,6 +923,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if args.init_state_dict_path:
+        init_state = torch.load(args.init_state_dict_path, map_location="cpu")
+        base_model.load_state_dict(init_state, strict=args.init_state_dict_strict)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -908,6 +994,10 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.init_state_dict_path:
+        log0(f"init_state_dict_path:{args.init_state_dict_path}")
+    run_summary["trainer"]["model_params"] = int(n_params)
+    refresh_summary("running")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -952,6 +1042,8 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                emit_metric("warmup", warmup_step=warmup_step + 1, warmup_steps=args.warmup_steps)
+                update_heartbeat("warmup", warmup_step=warmup_step + 1, warmup_steps=args.warmup_steps)
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -977,22 +1069,65 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
+            final_sliding = last_step and args.final_eval_mode == "sliding"
+            if final_sliding:
+                val_loss, val_bpb = eval_val_sliding_window(
+                    seq_len=args.train_seq_len,
+                    model_for_logits=base_model,
+                    rank=rank,
+                    world_size=world_size,
+                    device=device,
+                    val_tokens=val_tokens,
+                    base_bytes_lut=base_bytes_lut,
+                    has_leading_space_lut=has_leading_space_lut,
+                    is_boundary_token_lut=is_boundary_token_lut,
+                    stride=args.final_eval_stride,
+                )
+            else:
+                val_loss, val_bpb = eval_val(
+                    args,
+                    model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            run_summary["metrics"]["last_prequant_val_loss"] = val_loss
+            run_summary["metrics"]["last_prequant_val_bpb"] = val_bpb
+            run_summary["progress"] = {
+                "step": step,
+                "iterations": args.iterations,
+                "elapsed_train_ms": round(training_time_ms, 3),
+                "step_avg_ms": round(training_time_ms / max(step, 1), 4),
+            }
+            emit_metric(
+                "val",
+                step=step,
+                iterations=args.iterations,
+                val_loss=val_loss,
+                val_bpb=val_bpb,
+                train_time_ms=training_time_ms,
+                step_avg_ms=training_time_ms / max(step, 1),
+                eval_mode="sliding" if final_sliding else "standard",
+                stride=args.final_eval_stride if final_sliding else None,
+            )
+            update_heartbeat(
+                "validation",
+                step=step,
+                iterations=args.iterations,
+                elapsed_train_ms=round(training_time_ms, 3),
+                step_avg_ms=round(training_time_ms / max(step, 1), 4),
+                val_bpb=val_bpb,
+            )
+            refresh_summary("running")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1044,6 +1179,29 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            emit_metric(
+                "train",
+                step=step,
+                iterations=args.iterations,
+                train_loss=train_loss.item(),
+                train_time_ms=approx_training_time_ms,
+                step_avg_ms=approx_training_time_ms / step,
+            )
+            update_heartbeat(
+                "train",
+                step=step,
+                iterations=args.iterations,
+                elapsed_train_ms=round(approx_training_time_ms, 3),
+                step_avg_ms=round(approx_training_time_ms / step, 4),
+                train_loss=round(train_loss.item(), 6),
+            )
+            run_summary["progress"] = {
+                "step": step,
+                "iterations": args.iterations,
+                "elapsed_train_ms": round(approx_training_time_ms, 3),
+                "step_avg_ms": round(approx_training_time_ms / step, 4),
+            }
+            refresh_summary("running")
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1058,65 +1216,179 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    peak_alloc_mib = int(torch.cuda.max_memory_allocated() // 1024 // 1024)
+    peak_reserved_mib = int(torch.cuda.max_memory_reserved() // 1024 // 1024)
+    stop_reason = "wallclock_cap" if stop_after_step is not None and step < args.iterations else "iterations"
+    run_summary["progress"] = {
+        "step": step,
+        "iterations": args.iterations,
+        "elapsed_train_ms": round(training_time_ms, 3),
+        "step_avg_ms": round(training_time_ms / max(step, 1), 4),
+        "stop_reason": stop_reason,
+        "peak_alloc_mib": peak_alloc_mib,
+        "peak_reserved_mib": peak_reserved_mib,
+    }
+    emit_metric(
+        "artifact",
+        step=step,
+        iterations=args.iterations,
+        peak_alloc_mib=peak_alloc_mib,
+        peak_reserved_mib=peak_reserved_mib,
+        stop_reason=stop_reason,
+    )
+    update_heartbeat(
+        "export",
+        step=step,
+        iterations=args.iterations,
+        elapsed_train_ms=round(training_time_ms, 3),
+        step_avg_ms=round(training_time_ms / max(step, 1), 4),
+        stop_reason=stop_reason,
+    )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # the compressed export artifact and validate the round-tripped weights.
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
-        model_bytes = os.path.getsize("final_model.pt")
+        torch.save(base_model.state_dict(), export_model_path)
+        model_bytes = os.path.getsize(export_model_path)
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        run_summary["artifacts"]["raw_model_bytes"] = model_bytes
+        run_summary["artifacts"]["code_bytes"] = code_bytes
+        run_summary["artifacts"]["raw_total_bytes"] = model_bytes + code_bytes
+        emit_metric("artifact", raw_model_bytes=model_bytes, code_bytes=code_bytes, raw_total_bytes=model_bytes + code_bytes)
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats, export_label = export_state_dict(export_config, base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob, compressor_label = compress_export_blob(quant_raw, args.export_compressor)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(export_blob_path, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(export_blob_path)
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        payload_bytes = int(quant_stats.get("int8_payload_bytes", quant_stats.get("export_payload_bytes", 0)))
+        ratio = quant_stats["baseline_tensor_bytes"] / max(payload_bytes, 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model {export_label}+{compressor_label}: {quant_file_bytes} bytes "
+            f"(payload:{payload_bytes} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size {export_label}+{compressor_label}: {quant_file_bytes + code_bytes} bytes")
+        if args.export_scheme == "int8_zlib":
+            log0(
+                f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+                f"(payload:{payload_bytes} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            )
+            log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        run_summary["artifacts"].update(
+            {
+                "export_label": export_label,
+                "compressor_label": compressor_label,
+                "export_model_bytes": quant_file_bytes,
+                "export_payload_bytes": payload_bytes,
+                "export_total_bytes": quant_file_bytes + code_bytes,
+                "payload_ratio": round(ratio, 6),
+                "export_blob_path": str(export_blob_path.resolve()),
+                "raw_model_path": str(export_model_path.resolve()),
+            }
+        )
+        emit_metric(
+            "artifact",
+            export_label=export_label,
+            compressor_label=compressor_label,
+            export_model_bytes=quant_file_bytes,
+            export_payload_bytes=payload_bytes,
+            export_total_bytes=quant_file_bytes + code_bytes,
+            payload_ratio=ratio,
+        )
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(export_blob_path, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    quant_state = torch.load(io.BytesIO(decompress_export_blob(quant_blob_disk, args.export_compressor)), map_location="cpu")
+    roundtrip_state = dequantize_exported_state(quant_state)
+    base_model.load_state_dict(roundtrip_state, strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    if args.final_eval_mode == "sliding":
+        q_val_loss, q_val_bpb = eval_val_sliding_window(
+            seq_len=args.train_seq_len,
+            model_for_logits=base_model,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            val_tokens=val_tokens,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+            stride=args.final_eval_stride,
+        )
+    else:
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
     torch.cuda.synchronize()
+    eval_time_ms = 1000.0 * (time.perf_counter() - t_qeval)
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        f"final_{export_label}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"eval_time:{eval_time_ms:.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_{export_label}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(
+        f"final_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"eval_time:{eval_time_ms:.0f}ms export_label:{export_label}"
+    )
+    if args.export_scheme == "int8_zlib":
+        log0(
+            f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{eval_time_ms:.0f}ms"
+        )
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    run_summary["metrics"].update(
+        {
+            "final_roundtrip_val_loss": q_val_loss,
+            "final_roundtrip_val_bpb": q_val_bpb,
+            "final_eval_time_ms": round(eval_time_ms, 3),
+        }
+    )
+    emit_metric(
+        "final",
+        export_label=export_label,
+        final_roundtrip_val_loss=q_val_loss,
+        final_roundtrip_val_bpb=q_val_bpb,
+        final_eval_time_ms=eval_time_ms,
+    )
+    update_heartbeat(
+        "complete",
+        step=step,
+        iterations=args.iterations,
+        elapsed_train_ms=round(training_time_ms, 3),
+        step_avg_ms=round(training_time_ms / max(step, 1), 4),
+        final_roundtrip_val_bpb=q_val_bpb,
+        export_total_bytes=run_summary["artifacts"].get("export_total_bytes"),
+    )
+    end_time = time.time()
+    run_summary["end_time_unix"] = end_time
+    run_summary["end_time_iso"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_time))
+    refresh_summary("completed")
 
     if distributed:
         dist.destroy_process_group()
