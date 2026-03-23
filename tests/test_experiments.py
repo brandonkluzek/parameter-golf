@@ -7,7 +7,7 @@ from unittest import mock
 from pathlib import Path
 
 from tools.experiments import REPO_ROOT
-from tools.experiments.__main__ import _queue_job_brief, _status_payload
+from tools.experiments.__main__ import _queue_job_brief, _queue_status_payload, _status_payload
 from tools.experiments.estimator import estimate_manifest
 from tools.experiments.launch import bootstrap_runpod_host, needs_dataset_sync
 from tools.experiments.manifest import available_variants, resolve_manifest, write_resolved_manifest
@@ -84,6 +84,7 @@ class ExperimentOpsTests(unittest.TestCase):
         self.assertEqual(payload["progress_percent"], 25.0)
         self.assertEqual(payload["eta_to_iteration_finish_ms"], 7500.0)
         self.assertEqual(payload["eta_to_wallclock_stop_ms"], 117500.0)
+        self.assertEqual(payload["eta_to_completion_ms"], 7500.0)
 
     def test_queue_job_brief_includes_running_progress(self) -> None:
         resolved = resolve_manifest(REPO_ROOT / "experiments" / "baseline_1gpu_smoke.toml")
@@ -110,6 +111,42 @@ class ExperimentOpsTests(unittest.TestCase):
         self.assertEqual(payload["progress_percent"], 25.0)
         self.assertEqual(payload["eta_to_iteration_finish_ms"], 15000.0)
         self.assertEqual(payload["eta_to_wallclock_stop_ms"], 115000.0)
+        self.assertEqual(payload["eta_to_completion_ms"], 15000.0)
+
+    def test_queue_status_payload_exposes_current_and_total_eta(self) -> None:
+        resolved = resolve_manifest(REPO_ROOT / "experiments" / "baseline_1gpu_smoke.toml")
+        job = {
+            "job_id": "job-1",
+            "resolved_variant_name": resolved.variant_name,
+            "priority": 100,
+            "required_gpus": 1,
+            "state": "running",
+            "state_reason": "",
+            "run_id": "run_a",
+            "assigned_gpu_ids": [0],
+            "host_slug": "pod-a",
+            "estimate": {"predicted_bytes": {"total_bytes": 123}, "predicted_timing": {"step_ms": 42.0}},
+            "resolved_manifest": resolved.to_dict(),
+            "last_heartbeat": {
+                "phase": "train",
+                "step": 50,
+                "iterations": 200,
+                "elapsed_train_ms": 5000.0,
+                "step_avg_ms": 100.0,
+            },
+        }
+        state = {
+            "jobs": {"job-1": job},
+            "hosts": {"pod-a": {"host": "pod-a", "host_slug": "pod-a", "capacity_gpus": 1}},
+            "meta": {"updated_at_iso": "2026-03-23T00:00:00Z", "event_count": 1},
+        }
+        with mock.patch("tools.experiments.__main__.rebuild_queue_state", return_value=state):
+            with mock.patch("tools.experiments.__main__.queue_eta_seconds", return_value=321.0):
+                payload = _queue_status_payload("pod-a")
+        self.assertEqual(payload["queue_eta_seconds"], 321.0)
+        self.assertEqual(payload["eta_seconds"], 321.0)
+        self.assertEqual(payload["current_run_eta_seconds"], 15.0)
+        self.assertEqual(payload["current_run"]["eta_to_completion_ms"], 15000.0)
 
     def test_promote_run_creates_record_draft(self) -> None:
         resolved = resolve_manifest(REPO_ROOT / "experiments" / "baseline_1gpu_smoke.toml")

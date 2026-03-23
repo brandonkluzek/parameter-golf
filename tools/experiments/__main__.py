@@ -114,14 +114,21 @@ def _progress_fields(
     iterations_value = _float_value(iterations)
     elapsed_value = _float_value(elapsed_train_ms)
     step_avg_value = _float_value(step_avg_ms)
+    iteration_eta_ms: float | None = None
+    wallclock_eta_ms: float | None = None
     if step_value is not None and iterations_value is not None and iterations_value > 0:
         progress_percent = max(0.0, min(step_value / iterations_value, 1.0)) * 100.0
         payload["progress_percent"] = round(progress_percent, 3)
     if step_value is not None and iterations_value is not None and step_avg_value is not None and step_value > 0:
         remaining_steps = max(iterations_value - step_value, 0.0)
-        payload["eta_to_iteration_finish_ms"] = round(remaining_steps * step_avg_value, 3)
+        iteration_eta_ms = remaining_steps * step_avg_value
+        payload["eta_to_iteration_finish_ms"] = round(iteration_eta_ms, 3)
     if elapsed_value is not None and max_wallclock_s is not None and max_wallclock_s > 0:
-        payload["eta_to_wallclock_stop_ms"] = round(max(0.0, max_wallclock_s * 1000.0 - elapsed_value), 3)
+        wallclock_eta_ms = max(0.0, max_wallclock_s * 1000.0 - elapsed_value)
+        payload["eta_to_wallclock_stop_ms"] = round(wallclock_eta_ms, 3)
+    eta_candidates = [value for value in (iteration_eta_ms, wallclock_eta_ms) if value is not None]
+    if eta_candidates:
+        payload["eta_to_completion_ms"] = round(min(eta_candidates), 3)
     return payload
 
 
@@ -251,7 +258,18 @@ def _queue_status_payload(host: str | None = None) -> dict[str, object]:
     }
     if host is not None:
         slug = host_slug(host)
-        payload["eta_seconds"] = queue_eta_seconds(state, slug, int(dict(hosts.get(slug, {})).get("capacity_gpus", 1) or 1))
+        host_capacity = int(dict(hosts.get(slug, {})).get("capacity_gpus", 1) or 1)
+        queue_eta = queue_eta_seconds(state, slug, host_capacity)
+        payload["queue_eta_seconds"] = queue_eta
+        payload["eta_seconds"] = queue_eta
+        active = active_jobs_for_host(state, slug)
+        if len(active) == 1:
+            running_job = _queue_job_brief(active[0])
+            payload["current_run"] = running_job
+            if running_job.get("eta_to_completion_ms") is not None:
+                payload["current_run_eta_seconds"] = round(float(running_job["eta_to_completion_ms"]) / 1000.0, 3)
+            else:
+                payload["current_run_eta_seconds"] = None
     payload["running"] = [_queue_job_brief(job) for job in jobs if job.get("state") in ACTIVE_JOB_STATES]
     payload["queued"] = [_queue_job_brief(job) for job in queued_jobs(state)]
     payload["blocked"] = [_queue_job_brief(job) for job in jobs if job.get("state") == "blocked"]
