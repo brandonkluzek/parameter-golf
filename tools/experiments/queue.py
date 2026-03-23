@@ -232,9 +232,12 @@ def should_fail_overrun(heartbeat: dict[str, object] | None, predicted_step_ms: 
     step_avg_ms = heartbeat.get("step_avg_ms")
     if step_avg_ms is None:
         return False
-    if step < 50 and elapsed_ms < 60000.0:
+    # The current 1xH100 estimator is not calibrated tightly enough to support
+    # aggressive auto-killing. Keep the guardrail only for clearly pathological
+    # stalls after several minutes of stable runtime.
+    if step < 200 or elapsed_ms < 300000.0:
         return False
-    return float(step_avg_ms) > predicted_step_ms * 1.35
+    return float(step_avg_ms) > predicted_step_ms * 20.0
 
 
 def classify_remote_snapshot(

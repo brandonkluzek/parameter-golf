@@ -143,7 +143,7 @@ MAX_WALLCLOCK_SECONDS = 10
         self.assertIsNone(queue_mod.allocate_gpu_slots(queue_mod.free_gpu_slots(state, "pod-a", 8), 8))
 
     def test_overrun_and_restart_classification(self) -> None:
-        heartbeat = {"step": 55, "elapsed_train_ms": 70000.0, "step_avg_ms": 100.0}
+        heartbeat = {"step": 250, "elapsed_train_ms": 400000.0, "step_avg_ms": 1200.0}
         self.assertTrue(queue_mod.should_fail_overrun(heartbeat, predicted_step_ms=50.0))
         self.assertEqual(
             queue_mod.classify_remote_snapshot(
@@ -154,6 +154,8 @@ MAX_WALLCLOCK_SECONDS = 10
             )[0],
             "failed_overrun",
         )
+        healthy_but_slow = {"step": 55, "elapsed_train_ms": 70000.0, "step_avg_ms": 100.0}
+        self.assertFalse(queue_mod.should_fail_overrun(healthy_but_slow, predicted_step_ms=50.0))
         self.assertEqual(
             queue_mod.classify_remote_snapshot(
                 heartbeat=None,
