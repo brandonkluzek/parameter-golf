@@ -92,6 +92,39 @@ def _write_remote_metadata(run_id: str, metadata: dict[str, object]) -> None:
     (run_dir / "remote.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
+def _float_value(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _progress_fields(
+    *,
+    step: object,
+    iterations: object,
+    elapsed_train_ms: object,
+    step_avg_ms: object,
+    max_wallclock_s: float | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    step_value = _float_value(step)
+    iterations_value = _float_value(iterations)
+    elapsed_value = _float_value(elapsed_train_ms)
+    step_avg_value = _float_value(step_avg_ms)
+    if step_value is not None and iterations_value is not None and iterations_value > 0:
+        progress_percent = max(0.0, min(step_value / iterations_value, 1.0)) * 100.0
+        payload["progress_percent"] = round(progress_percent, 3)
+    if step_value is not None and iterations_value is not None and step_avg_value is not None and step_value > 0:
+        remaining_steps = max(iterations_value - step_value, 0.0)
+        payload["eta_to_iteration_finish_ms"] = round(remaining_steps * step_avg_value, 3)
+    if elapsed_value is not None and max_wallclock_s is not None and max_wallclock_s > 0:
+        payload["eta_to_wallclock_stop_ms"] = round(max(0.0, max_wallclock_s * 1000.0 - elapsed_value), 3)
+    return payload
+
+
 def _status_payload(run_dir: Path, heartbeat: dict[str, object]) -> dict[str, object]:
     payload = {"run_id": heartbeat.get("run_id", run_dir.name), "phase": heartbeat.get("phase")}
     payload["timestamp_iso"] = heartbeat.get("timestamp_iso")
@@ -100,18 +133,26 @@ def _status_payload(run_dir: Path, heartbeat: dict[str, object]) -> dict[str, ob
     payload["elapsed_train_ms"] = heartbeat.get("elapsed_train_ms")
     payload["step_avg_ms"] = heartbeat.get("step_avg_ms")
     payload["last_event"] = heartbeat.get("last_event")
+    max_wallclock_s: float | None = None
     manifest_path = run_dir / "manifest.resolved.toml"
     estimate_path = run_dir / "estimate.json"
     if manifest_path.exists():
         resolved = resolve_manifest(manifest_path)
         max_wallclock_s = float(resolved.env.get("MAX_WALLCLOCK_SECONDS", 600))
-        if heartbeat.get("elapsed_train_ms") is not None and max_wallclock_s > 0:
-            payload["eta_to_wallclock_stop_ms"] = max(0.0, max_wallclock_s * 1000.0 - float(heartbeat["elapsed_train_ms"]))
         payload["manifest"] = {
             "variant_name": resolved.variant_name,
             "resource_class": resolved.resource_class,
             "script_path": resolved.script_path,
         }
+    payload.update(
+        _progress_fields(
+            step=heartbeat.get("step"),
+            iterations=heartbeat.get("iterations"),
+            elapsed_train_ms=heartbeat.get("elapsed_train_ms"),
+            step_avg_ms=heartbeat.get("step_avg_ms"),
+            max_wallclock_s=max_wallclock_s,
+        )
+    )
     if estimate_path.exists() and heartbeat.get("step_avg_ms") is not None:
         estimate = json.loads(estimate_path.read_text(encoding="utf-8"))
         predicted_step_ms = estimate["predicted_timing"]["step_ms"]
@@ -169,7 +210,7 @@ def _remote_snapshot(remote: dict[str, object]) -> dict[str, object]:
 
 
 def _queue_job_brief(job: dict[str, object]) -> dict[str, object]:
-    return {
+    payload = {
         "job_id": job["job_id"],
         "variant": job["resolved_variant_name"],
         "priority": job["priority"],
@@ -181,6 +222,23 @@ def _queue_job_brief(job: dict[str, object]) -> dict[str, object]:
         "predicted_total_bytes": job.get("estimate", {}).get("predicted_bytes", {}).get("total_bytes"),
         "predicted_step_ms": job.get("estimate", {}).get("predicted_timing", {}).get("step_ms"),
     }
+    heartbeat = dict(job.get("last_heartbeat") or {})
+    if heartbeat:
+        payload["phase"] = heartbeat.get("phase")
+        payload["step"] = heartbeat.get("step")
+        payload["iterations"] = heartbeat.get("iterations")
+        payload["elapsed_train_ms"] = heartbeat.get("elapsed_train_ms")
+        payload["step_avg_ms"] = heartbeat.get("step_avg_ms")
+        payload.update(
+            _progress_fields(
+                step=heartbeat.get("step"),
+                iterations=heartbeat.get("iterations"),
+                elapsed_train_ms=heartbeat.get("elapsed_train_ms"),
+                step_avg_ms=heartbeat.get("step_avg_ms"),
+                max_wallclock_s=float(resolved_manifest_for_job(job).env.get("MAX_WALLCLOCK_SECONDS", 600) or 600),
+            )
+        )
+    return payload
 
 
 def _queue_status_payload(host: str | None = None) -> dict[str, object]:

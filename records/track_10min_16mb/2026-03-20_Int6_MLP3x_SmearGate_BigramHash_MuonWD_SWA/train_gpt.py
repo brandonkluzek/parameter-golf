@@ -9,9 +9,12 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import json
 import math
 import os
 import random
+import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -852,11 +855,150 @@ def main() -> None:
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
 
+    run_dir_env = os.environ.get("RUN_DIR", "").strip()
+    run_dir = Path(run_dir_env).resolve() if run_dir_env else None
+    if master_process and run_dir is not None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+
     logfile = None
     if master_process:
-        os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{args.run_id}.txt"
+        if run_dir is not None:
+            logfile = str(run_dir / "train.log")
+        else:
+            os.makedirs("logs", exist_ok=True)
+            logfile = f"logs/{args.run_id}.txt"
         print(logfile)
+
+    def resolve_optional_path(env_name: str, default_name: str) -> Path | None:
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            return Path(raw).resolve()
+        if run_dir is not None:
+            return run_dir / default_name
+        return None
+
+    metrics_jsonl_path = resolve_optional_path("METRICS_JSONL_PATH", "metrics.jsonl")
+    heartbeat_json_path = resolve_optional_path("HEARTBEAT_JSON_PATH", "heartbeat.json")
+    summary_json_path = resolve_optional_path("SUMMARY_JSON_PATH", "summary.json")
+    export_model_path = (run_dir / "final_model.pt") if run_dir is not None else Path("final_model.pt")
+    export_blob_path = (run_dir / "final_model.int8.ptz") if run_dir is not None else Path("final_model.int8.ptz")
+
+    git_sha = ""
+    git_sha_result = subprocess.run(["git", "rev-parse", "HEAD"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if git_sha_result.returncode == 0:
+        git_sha = git_sha_result.stdout.strip()
+    command_line = " ".join(shlex.quote(arg) for arg in sys.argv)
+    host_name = socket.gethostname()
+    manifest_name = os.environ.get("EXPERIMENT_NAME", "")
+    manifest_sha256 = os.environ.get("MANIFEST_SHA256", "")
+    queue_job_id = os.environ.get("QUEUE_JOB_ID", "")
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    start_time = time.time()
+    run_summary: dict[str, object] = {
+        "status": "running",
+        "run_id": args.run_id,
+        "experiment_name": manifest_name,
+        "manifest_sha256": manifest_sha256,
+        "git_sha": git_sha,
+        "host": host_name,
+        "script_path": str(Path(__file__).resolve()),
+        "command": command_line,
+        "start_time_unix": start_time,
+        "start_time_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time)),
+        "seed": args.seed,
+        "world_size": world_size,
+        "local_rank": local_rank,
+        "gpu_name": torch.cuda.get_device_name(device),
+        "trainer": {
+            "data_path": str(Path(args.data_path).resolve()),
+            "tokenizer_path": str(Path(args.tokenizer_path).resolve()),
+            "vocab_size": args.vocab_size,
+            "train_batch_tokens": args.train_batch_tokens,
+            "train_seq_len": args.train_seq_len,
+            "iterations": args.iterations,
+            "warmup_steps": args.warmup_steps,
+            "max_wallclock_seconds": args.max_wallclock_seconds,
+            "num_layers": args.num_layers,
+            "model_dim": args.model_dim,
+            "num_heads": args.num_heads,
+            "num_kv_heads": args.num_kv_heads,
+            "mlp_mult": args.mlp_mult,
+            "tie_embeddings": args.tie_embeddings,
+            "eval_stride": args.eval_stride,
+            "eval_batch_seqs": args.eval_batch_seqs,
+            "bigram_vocab_size": args.bigram_vocab_size,
+            "bigram_dim": args.bigram_dim,
+            "swa_enabled": args.swa_enabled,
+            "swa_start_frac": args.swa_start_frac,
+            "swa_every": args.swa_every,
+        },
+        "progress": {},
+        "metrics": {},
+        "artifacts": {},
+        "provenance": {
+            "manifest_name": manifest_name,
+            "manifest_sha256": manifest_sha256,
+            "queue_job_id": queue_job_id,
+            "cuda_visible_devices": cuda_visible_devices,
+        },
+    }
+    last_metric_event: dict[str, object] = {}
+
+    def write_json_atomic(path: Path | None, payload: dict[str, object]) -> None:
+        if not master_process or path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+
+    def emit_metric(event_type: str, **payload: object) -> None:
+        nonlocal last_metric_event
+        if not master_process:
+            return
+        event = {
+            "type": event_type,
+            "run_id": args.run_id,
+            "timestamp_unix": time.time(),
+            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **payload,
+        }
+        last_metric_event = event
+        if metrics_jsonl_path is not None:
+            metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(metrics_jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def update_heartbeat(phase: str, **payload: object) -> None:
+        if not master_process:
+            return
+        heartbeat = {
+            "run_id": args.run_id,
+            "phase": phase,
+            "timestamp_unix": time.time(),
+            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "last_event": last_metric_event,
+            "provenance": run_summary.get("provenance", {}),
+            **payload,
+        }
+        write_json_atomic(heartbeat_json_path, heartbeat)
+
+    def refresh_summary(status: str, **updates: object) -> None:
+        if not master_process:
+            return
+        run_summary["status"] = status
+        run_summary.update(updates)
+        write_json_atomic(summary_json_path, run_summary)
+
+    def progress_payload(step: int, elapsed_train_ms: float, **extra: object) -> dict[str, object]:
+        progress = {
+            "step": step,
+            "iterations": args.iterations,
+            "elapsed_train_ms": round(elapsed_train_ms, 3),
+            "step_avg_ms": round(elapsed_train_ms / max(step, 1), 4),
+        }
+        progress.update(extra)
+        return progress
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -876,6 +1018,7 @@ def main() -> None:
         console=False,
     )
     log0("=" * 100, console=False)
+    refresh_summary("running")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -991,6 +1134,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    run_summary["trainer"]["model_params"] = int(n_params)
+    refresh_summary("running")
 
     # DATA LOADER & MODEL WARMUP
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1030,6 +1175,8 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                emit_metric("warmup", warmup_step=warmup_step + 1, warmup_steps=args.warmup_steps)
+                update_heartbeat("warmup", warmup_step=warmup_step + 1, warmup_steps=args.warmup_steps)
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1062,6 +1209,27 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            run_summary["metrics"]["last_prequant_val_loss"] = val_loss
+            run_summary["metrics"]["last_prequant_val_bpb"] = val_bpb
+            run_summary["progress"] = progress_payload(step, training_time_ms)
+            emit_metric(
+                "val",
+                step=step,
+                iterations=args.iterations,
+                val_loss=val_loss,
+                val_bpb=val_bpb,
+                train_time_ms=training_time_ms,
+                step_avg_ms=training_time_ms / max(step, 1),
+            )
+            update_heartbeat(
+                "validation",
+                step=step,
+                iterations=args.iterations,
+                elapsed_train_ms=round(training_time_ms, 3),
+                step_avg_ms=round(training_time_ms / max(step, 1), 4),
+                val_bpb=val_bpb,
+            )
+            refresh_summary("running")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1125,6 +1293,24 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            emit_metric(
+                "train",
+                step=step,
+                iterations=args.iterations,
+                train_loss=train_loss.item(),
+                train_time_ms=approx_training_time_ms,
+                step_avg_ms=approx_training_time_ms / step,
+            )
+            update_heartbeat(
+                "train",
+                step=step,
+                iterations=args.iterations,
+                elapsed_train_ms=round(approx_training_time_ms, 3),
+                step_avg_ms=round(approx_training_time_ms / step, 4),
+                train_loss=round(train_loss.item(), 6),
+            )
+            run_summary["progress"] = progress_payload(step, approx_training_time_ms)
+            refresh_summary("running")
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
@@ -1137,6 +1323,32 @@ def main() -> None:
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+    peak_alloc_mib = int(torch.cuda.max_memory_allocated() // 1024 // 1024)
+    peak_reserved_mib = int(torch.cuda.max_memory_reserved() // 1024 // 1024)
+    stop_reason = "wallclock_cap" if stop_after_step is not None and step < args.iterations else "iterations"
+    run_summary["progress"] = progress_payload(
+        step,
+        training_time_ms,
+        stop_reason=stop_reason,
+        peak_alloc_mib=peak_alloc_mib,
+        peak_reserved_mib=peak_reserved_mib,
+    )
+    emit_metric(
+        "artifact",
+        step=step,
+        iterations=args.iterations,
+        peak_alloc_mib=peak_alloc_mib,
+        peak_reserved_mib=peak_reserved_mib,
+        stop_reason=stop_reason,
+    )
+    update_heartbeat(
+        "export",
+        step=step,
+        iterations=args.iterations,
+        elapsed_train_ms=round(training_time_ms, 3),
+        step_avg_ms=round(training_time_ms / max(step, 1), 4),
+        stop_reason=stop_reason,
     )
 
     # Apply SWA if collected
@@ -1151,12 +1363,17 @@ def main() -> None:
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
-        model_bytes = os.path.getsize("final_model.pt")
+        torch.save(base_model.state_dict(), export_model_path)
+        model_bytes = os.path.getsize(export_model_path)
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        run_summary["artifacts"]["raw_model_bytes"] = model_bytes
+        run_summary["artifacts"]["code_bytes"] = code_bytes
+        run_summary["artifacts"]["raw_total_bytes"] = model_bytes + code_bytes
+        run_summary["artifacts"]["raw_model_path"] = str(export_model_path.resolve())
+        emit_metric("artifact", raw_model_bytes=model_bytes, code_bytes=code_bytes, raw_total_bytes=model_bytes + code_bytes)
 
     # INT6 mixed quantization + zstd/zlib export
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
@@ -1169,16 +1386,32 @@ def main() -> None:
     else:
         quant_blob = zlib.compress(quant_raw, 9)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(export_blob_path, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(export_blob_path)
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        run_summary["artifacts"].update(
+            {
+                "export_label": "int6",
+                "compressor_label": _COMPRESSOR,
+                "export_model_bytes": quant_file_bytes,
+                "export_total_bytes": quant_file_bytes + code_bytes,
+                "export_blob_path": str(export_blob_path.resolve()),
+            }
+        )
+        emit_metric(
+            "artifact",
+            export_label="int6",
+            compressor_label=_COMPRESSOR,
+            export_model_bytes=quant_file_bytes,
+            export_total_bytes=quant_file_bytes + code_bytes,
+        )
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(export_blob_path, "rb") as f:
         quant_blob_disk = f.read()
     if _COMPRESSOR == "zstd":
         decompressed = zstandard.ZstdDecompressor().decompress(quant_blob_disk)
@@ -1205,11 +1438,36 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
     torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
+    eval_time_ms = 1000.0 * (time.perf_counter() - t_qeval)
+    log0(f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{eval_time_ms:.0f}ms")
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    run_summary["metrics"].update(
+        {
+            "final_roundtrip_val_loss": q_val_loss,
+            "final_roundtrip_val_bpb": q_val_bpb,
+            "final_eval_time_ms": round(eval_time_ms, 3),
+        }
+    )
+    emit_metric(
+        "final",
+        export_label="int6",
+        final_roundtrip_val_loss=q_val_loss,
+        final_roundtrip_val_bpb=q_val_bpb,
+        final_eval_time_ms=eval_time_ms,
+    )
+    update_heartbeat(
+        "complete",
+        step=step,
+        iterations=args.iterations,
+        elapsed_train_ms=round(training_time_ms, 3),
+        step_avg_ms=round(training_time_ms / max(step, 1), 4),
+        final_roundtrip_val_bpb=q_val_bpb,
+        export_total_bytes=run_summary["artifacts"].get("export_total_bytes"),
+    )
+    end_time = time.time()
+    run_summary["end_time_unix"] = end_time
+    run_summary["end_time_iso"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_time))
+    refresh_summary("completed")
 
     if distributed:
         dist.destroy_process_group()

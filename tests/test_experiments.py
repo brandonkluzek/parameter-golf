@@ -7,6 +7,7 @@ from unittest import mock
 from pathlib import Path
 
 from tools.experiments import REPO_ROOT
+from tools.experiments.__main__ import _queue_job_brief, _status_payload
 from tools.experiments.estimator import estimate_manifest
 from tools.experiments.launch import bootstrap_runpod_host, needs_dataset_sync
 from tools.experiments.manifest import available_variants, resolve_manifest, write_resolved_manifest
@@ -63,6 +64,52 @@ class ExperimentOpsTests(unittest.TestCase):
             write_resolved_manifest(out_path, resolved)
             reloaded = resolve_manifest(out_path)
             self.assertEqual(reloaded.manual_block_reason, resolved.manual_block_reason)
+
+    def test_status_payload_includes_progress_and_eta(self) -> None:
+        resolved = resolve_manifest(REPO_ROOT / "experiments" / "baseline_1gpu_smoke.toml")
+        heartbeat = {
+            "run_id": "run_a",
+            "phase": "train",
+            "timestamp_iso": "2026-03-23T18:30:00Z",
+            "step": 25,
+            "iterations": 100,
+            "elapsed_train_ms": 2500.0,
+            "step_avg_ms": 100.0,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir) / "run_a"
+            run_dir.mkdir()
+            write_resolved_manifest(run_dir / "manifest.resolved.toml", resolved)
+            payload = _status_payload(run_dir, heartbeat)
+        self.assertEqual(payload["progress_percent"], 25.0)
+        self.assertEqual(payload["eta_to_iteration_finish_ms"], 7500.0)
+        self.assertEqual(payload["eta_to_wallclock_stop_ms"], 117500.0)
+
+    def test_queue_job_brief_includes_running_progress(self) -> None:
+        resolved = resolve_manifest(REPO_ROOT / "experiments" / "baseline_1gpu_smoke.toml")
+        job = {
+            "job_id": "job-1",
+            "resolved_variant_name": resolved.variant_name,
+            "priority": 100,
+            "required_gpus": 1,
+            "state": "running",
+            "state_reason": "",
+            "run_id": "run_a",
+            "assigned_gpu_ids": [0],
+            "estimate": {"predicted_bytes": {"total_bytes": 123}, "predicted_timing": {"step_ms": 42.0}},
+            "resolved_manifest": resolved.to_dict(),
+            "last_heartbeat": {
+                "phase": "train",
+                "step": 50,
+                "iterations": 200,
+                "elapsed_train_ms": 5000.0,
+                "step_avg_ms": 100.0,
+            },
+        }
+        payload = _queue_job_brief(job)
+        self.assertEqual(payload["progress_percent"], 25.0)
+        self.assertEqual(payload["eta_to_iteration_finish_ms"], 15000.0)
+        self.assertEqual(payload["eta_to_wallclock_stop_ms"], 115000.0)
 
     def test_promote_run_creates_record_draft(self) -> None:
         resolved = resolve_manifest(REPO_ROOT / "experiments" / "baseline_1gpu_smoke.toml")
